@@ -28,3 +28,10 @@ local.properties
 # OS Specific
 .DS_Store
 Thumbs.db
+
+# Generated Android intermediates and Unity recovery/simulator backups
+/.utmp/
+/Assets/_Recovery/
+/Assets/_Recovery.meta
+/Assets/XR/Temp/
+/Assets/XR/Temp.meta
