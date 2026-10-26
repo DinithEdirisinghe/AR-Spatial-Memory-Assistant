@@ -54,7 +54,7 @@ public static class WalkingRouteDemoSetup
         // Calling the public build API explicitly avoids automatic room-event rebuilds.
         nav.enabled = false;
         nav.CustomAgent = true;
-        nav.AgentRadius = 0.3f;
+        nav.AgentRadius = 0.25f;
         nav.AgentHeight = 1.7f;
         nav.AgentClimb = 0.04f;
         nav.AgentMaxSlope = 8f;

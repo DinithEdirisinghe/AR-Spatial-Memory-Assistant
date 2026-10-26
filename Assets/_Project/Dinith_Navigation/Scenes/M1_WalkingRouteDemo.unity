@@ -152,7 +152,7 @@ MonoBehaviour:
   BuildOnSceneLoaded: 0
   CollectGeometry: 1
   CollectObjects: 2
-  AgentRadius: 0.3
+  AgentRadius: 0.25
   AgentHeight: 1.7
   AgentClimb: 0.04
   AgentMaxSlope: 8

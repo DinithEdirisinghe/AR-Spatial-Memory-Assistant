@@ -20,6 +20,14 @@ namespace SpatialSense.RoomDemo
         [SerializeField] private Font displayFont;
         private Text statusText;
         private Text controlsText;
+        private GameObject statusPanel;
+        private bool panelVisible = true;
+
+        public void SetPanelVisible(bool value)
+        {
+            panelVisible = value;
+            if (statusPanel != null) statusPanel.SetActive(value);
+        }
         private Transform outlineRoot;
         private MRUKRoom displayedRoom;
         private bool initialized;
@@ -39,6 +47,7 @@ namespace SpatialSense.RoomDemo
         private PermissionCallbacks permissionCallbacks;
 #endif
         public bool IsRoomReady { get; private set; }
+        public string StatusMessage { get; private set; } = "Loading the room...";
         public MRUKRoom CurrentRoom => IsRoomReady ? displayedRoom : null;
         public int RoomRevision { get; private set; }
 
@@ -286,6 +295,7 @@ namespace SpatialSense.RoomDemo
         private void CreatePanel()
         {
             var panel = new GameObject("Room status", typeof(RectTransform), typeof(Canvas), typeof(Image));
+            statusPanel = panel;
             panel.transform.SetParent(cameraRig.centerEyeAnchor, false);
             panel.transform.localPosition = new Vector3(0, 0.25f, 1.25f);
             panel.transform.localScale = Vector3.one * 0.0013f;
@@ -297,6 +307,7 @@ namespace SpatialSense.RoomDemo
             statusText = ManualObjectDemo.AddText(panel.transform, "Status", displayFont, 18, new Vector2(600, 70), new Vector2(0, 12));
             controlsText = ManualObjectDemo.AddText(panel.transform, "Controls", displayFont, 16, new Vector2(600, 40), new Vector2(0, -55));
             UpdateControls();
+            panel.SetActive(panelVisible);
         }
 
         public void SetNavigationMapControls(bool active, bool visible)
@@ -312,6 +323,7 @@ namespace SpatialSense.RoomDemo
 
         private void SetStatus(string message)
         {
+            StatusMessage = message;
             if (statusText != null) statusText.text = message;
             Debug.Log($"[SpatialSense Room] {message}", this);
         }

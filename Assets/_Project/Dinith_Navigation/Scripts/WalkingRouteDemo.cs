@@ -12,7 +12,7 @@ using UnityEngine.Rendering;
 namespace SpatialSense.Navigation
 {
     [DisallowMultipleComponent]
-    public sealed class WalkingRouteDemo : MonoBehaviour
+    public sealed class WalkingRouteDemo : MonoBehaviour, Project.Core.Interfaces.INavMeshService
     {
         [SerializeField] private RoomUnderstandingDemo roomDemo;
         [SerializeField] private ManualObjectDemo objectDemo;
@@ -20,12 +20,25 @@ namespace SpatialSense.Navigation
         [SerializeField] private SceneNavigation sceneNavigation;
         [SerializeField] private Material routeMaterial;
         [SerializeField, Min(0f)] private float scanBuffer = 0.03f;
+        [SerializeField] private MonoBehaviour guidanceProvider;
+        [SerializeField] private MonoBehaviour spatialRegistryProvider;
+        private Project.Core.Interfaces.ISpatialRegistryService spatialRegistry;
+        public MonoBehaviour GuidanceProvider => guidanceProvider;
+        private Project.Core.Interfaces.IWayfindingRenderer guidance;
+        public event Action<string> Diagnostic;
+        public bool HasRouteFailure => !completeRoute && lastFailure != null;
+        public void ConfigureGuidance(MonoBehaviour provider)
+        {
+            if (!(provider is Project.Core.Interfaces.IWayfindingRenderer)) throw new ArgumentException("Provider must implement IWayfindingRenderer.");
+            guidanceProvider = provider;
+        }
+        public void ConfigureRegistry(MonoBehaviour provider)
+        {
+            if (!(provider is Project.Core.Interfaces.ISpatialRegistryService)) throw new ArgumentException("Provider must implement ISpatialRegistryService.");
+            spatialRegistryProvider = provider;
+        }
         private readonly List<NavMeshObstacle> footprints = new List<NavMeshObstacle>();
-        private LineRenderer routeLine;
-        private LineRenderer destinationRing;
         private GameObject mapPreview;
-        private GameObject arrowObject;
-        private Mesh arrowMesh;
         private readonly List<Mesh> previewMeshes = new List<Mesh>();
         private bool showMap;
         private string lastDiagnostic;
@@ -72,13 +85,14 @@ namespace SpatialSense.Navigation
                 enabled = false;
                 return;
             }
-            routeLine = MakeLine("Walking route", new Color(0.05f, 0.55f, 1f), 0.025f);
-            destinationRing = MakeLine("Standing position", Color.green, 0.018f);
-            destinationRing.loop = true;
-            arrowObject = MakeMeshObject("Route arrows", new Color(0.05f, 0.55f, 1f), transform);
-            arrowMesh = new Mesh { name = "Route arrow geometry" };
-            arrowObject.GetComponent<MeshFilter>().sharedMesh = arrowMesh;
-            arrowObject.SetActive(false);
+            guidance = guidanceProvider as Project.Core.Interfaces.IWayfindingRenderer;
+            spatialRegistry = spatialRegistryProvider as Project.Core.Interfaces.ISpatialRegistryService;
+            if (guidance == null)
+            {
+                var fallback = gameObject.AddComponent<Project.Core.Integration.DefaultGuidanceRenderer>();
+                fallback.Configure(routeMaterial);
+                guidance = fallback;
+            }
             roomDemo.SetNavigationMapControls(true, false);
         }
 
@@ -108,12 +122,19 @@ namespace SpatialSense.Navigation
             if (building || !navigationReady) return;
             if (!objectDemo.IsSearching)
             {
+                lastFailure = null;
                 HideRoute();
                 goalValid = false;
                 nextPlan = 0f;
                 return;
             }
-            if (plannedTarget != objectDemo.RegisteredPosition)
+            if (!TryGetSelectedTarget(out var currentTarget))
+            {
+                HideRoute();
+                StatusText = "Selected object location is unavailable. Wait for its anchor to be located.";
+                return;
+            }
+            if ((plannedTarget - currentTarget).sqrMagnitude > 0.0025f)
             {
                 goalValid = false;
                 nextPlan = 0f;
@@ -125,7 +146,7 @@ namespace SpatialSense.Navigation
             }
             if (completeRoute)
             {
-                StatusText = CanConfirmAtTarget ? "At the viewing spot. Locate your keys, point at their marker and press the trigger to confirm."
+                StatusText = CanConfirmAtTarget ? $"At the viewing spot. Locate {objectDemo.CurrentObjectName}, point at its marker and press the trigger to confirm."
                     : "Follow the blue route toward the green standing-position ring.";
                 DistanceText = $"Walking route: {routeLength:F1} m | Blue floor arrows lead to the green ring.\nSaved room scan | Left trigger: inspect walking map";
             }
@@ -229,7 +250,7 @@ namespace SpatialSense.Navigation
         private void PlanRoute()
         {
             HideRoute();
-            plannedTarget = objectDemo.RegisteredPosition;
+            if (!TryGetSelectedTarget(out plannedTarget)) { NoRoute("Selected object location is not currently located."); return; }
             var projectedStart = new Vector3(cameraRig.centerEyeAnchor.position.x, floorY, cameraRig.centerEyeAnchor.position.z);
             if (!room.IsPositionInRoom(projectedStart, false))
             {
@@ -340,53 +361,8 @@ namespace SpatialSense.Navigation
             completeRoute = true;
             var corners = path.corners;
             routeLength = PathLength(corners);
-            routeLine.positionCount = corners.Length;
-            for (var i = 0; i < corners.Length; i++) routeLine.SetPosition(i, corners[i] + Vector3.up * 0.035f);
-            routeLine.enabled = corners.Length > 1;
-            destinationRing.positionCount = 32;
-            for (var i = 0; i < 32; i++)
-            {
-                var angle = i * Mathf.PI * 2f / 32f;
-                destinationRing.SetPosition(i, goal + new Vector3(Mathf.Cos(angle) * 0.15f, 0.04f, Mathf.Sin(angle) * 0.15f));
-            }
-            destinationRing.enabled = true;
-            DrawArrows(corners);
+            guidance?.DisplayGuidancePath(corners);
             LogDiagnostic($"Complete route: corners={corners.Length}, length={routeLength:F1}m, obstacles={footprints.Count}, goal={goal:F2}");
-        }
-
-        private void DrawArrows(Vector3[] corners)
-        {
-            var vertices = new List<Vector3>();
-            var triangles = new List<int>();
-            var travelled = 0f;
-            var nextArrow = 0.35f;
-            for (var i = 1; i < corners.Length; i++)
-            {
-                var delta = corners[i] - corners[i - 1];
-                var length = delta.magnitude;
-                var forward = Vector3.ProjectOnPlane(delta, Vector3.up).normalized;
-                var right = Vector3.Cross(Vector3.up, forward);
-                while (nextArrow <= travelled + length && length > 0.001f)
-                {
-                    var onSegment = nextArrow - travelled;
-                    if (onSegment > 0.15f && onSegment < length - 0.15f)
-                    {
-                        var center = corners[i - 1] + delta * (onSegment / length) + Vector3.up * 0.055f;
-                        var index = vertices.Count;
-                        vertices.Add(arrowObject.transform.InverseTransformPoint(center + forward * 0.12f));
-                        vertices.Add(arrowObject.transform.InverseTransformPoint(center - forward * 0.07f - right * 0.07f));
-                        vertices.Add(arrowObject.transform.InverseTransformPoint(center - forward * 0.07f + right * 0.07f));
-                        triangles.Add(index); triangles.Add(index + 2); triangles.Add(index + 1);
-                    }
-                    nextArrow += 0.6f;
-                }
-                travelled += length;
-            }
-            arrowMesh.Clear();
-            arrowMesh.SetVertices(vertices);
-            arrowMesh.SetTriangles(triangles, 0);
-            arrowMesh.RecalculateBounds();
-            arrowObject.SetActive(vertices.Count > 0);
         }
 
         private void CreateMapPreview()
@@ -467,6 +443,7 @@ namespace SpatialSense.Navigation
         {
             if (lastDiagnostic == message) return;
             lastDiagnostic = message;
+            Diagnostic?.Invoke(message);
             Debug.Log($"[SpatialSense Navigation] {message}", this);
         }
 
@@ -493,6 +470,7 @@ namespace SpatialSense.Navigation
             DistanceText = "No walking guidance is shown. Left Y reloads the saved room.";
             if (lastFailure != StatusText)
             {
+                Diagnostic?.Invoke(StatusText);
                 Debug.Log($"[SpatialSense Navigation] {StatusText}", this);
                 lastFailure = StatusText;
             }
@@ -501,12 +479,42 @@ namespace SpatialSense.Navigation
         private void HideRoute()
         {
             completeRoute = false;
-            if (routeLine != null) routeLine.enabled = false;
-            if (destinationRing != null) destinationRing.enabled = false;
-            if (arrowObject != null) arrowObject.SetActive(false);
+            guidance?.ClearGuidancePath();
         }
 
         private static float HorizontalDistance(Vector3 a, Vector3 b) => Vector2.Distance(new Vector2(a.x, a.z), new Vector2(b.x, b.z));
+
+        private bool TryGetSelectedTarget(out Vector3 target)
+        {
+            target = objectDemo.RegisteredPosition;
+            return spatialRegistry == null || spatialRegistry.TryGetTargetCoordinates(Project.Core.Integration.ObservationPolicy.IdFor(objectDemo.CurrentObjectName), out target);
+        }
+
+        public bool TryCalculatePath(Vector3 startWorldPos, Vector3 targetWorldPos, out Vector3[] waypoints)
+        {
+            waypoints = Array.Empty<Vector3>();
+            if (!navigationReady || roomDemo == null || !roomDemo.IsRoomReady || roomDemo.RoomRevision != builtRevision
+                || !Finite(startWorldPos) || !Finite(targetWorldPos)) return false;
+            // Low-level queries require a reachable floor endpoint, not a tabletop object coordinate.
+            var projectedStart = new Vector3(startWorldPos.x, floorY, startWorldPos.z);
+            var projectedTarget = new Vector3(targetWorldPos.x, floorY, targetWorldPos.z);
+            if (!TrySampleFloor(projectedStart, 0.45f, out var start) || !TrySampleFloor(projectedTarget, 0.2f, out var end)
+                || !TryCompletePath(start, end, out var path)) return false;
+            waypoints = path.corners;
+            return true;
+        }
+
+        public void UpdateNavMeshRegion(Bounds dirtyBounds)
+        {
+            builtRevision = -1;
+            navigationReady = false;
+            goalValid = false;
+            HideRoute();
+            LogDiagnostic("Refresh requested: prototype rebuilds the current mapped room; localized incremental updates are not implemented.");
+        }
+
+        private static bool Finite(Vector3 p) => !float.IsNaN(p.x) && !float.IsNaN(p.y) && !float.IsNaN(p.z)
+            && !float.IsInfinity(p.x) && !float.IsInfinity(p.y) && !float.IsInfinity(p.z);
 
         private static float PathLength(Vector3[] corners)
         {
@@ -527,7 +535,6 @@ namespace SpatialSense.Navigation
         private void OnDestroy()
         {
             ClearMapPreview();
-            if (arrowMesh != null) Destroy(arrowMesh);
             if (sceneNavigation != null)
             {
                 var surface = sceneNavigation.GetComponent<NavMeshSurface>();

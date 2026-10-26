@@ -1,12 +1,18 @@
 # Walking route checkpoint
 
+## Clearance adjustment after headset feedback
+
+The setup command now uses an agent radius of **0.25 m**, reduced from 0.30 m. The scan buffer stays at 0.03 m. Run **SpatialSense > Create Walking Route Demo** again and rebuild to apply it to the existing scene. This reduces the nominal reserved distance by 5 cm on each side of an obstacle; voxel discretization affects the final boundary. The collision guard and red clearance preview both read the same agent radius automatically.
+
+Further adjustment is available on **Walking Route Demo > Scene Navigation > Agent Radius** in the Inspector. Save the scene and rebuild after changing it; rerunning the setup command restores the 0.25 m preset. This is prototype clearance, not a safety guarantee.
+
 ## Version 2 corrections
 
 Run **SpatialSense > Create Walking Route Demo** again and rebuild to apply the pointer colour and scene configuration. The lower panel identifies this build as **Walking route v2**.
 
 - The controller pointer is white, becoming yellow over a selectable marker. The walking route is blue with arrows on the floor. A straight controller pointer is not a walking route.
 - **Left index trigger** toggles a map preview: blue wire edges show the actual navigable floor triangles, and red outlines show obstacle clearance. Inspect this when a visually open gap is rejected or a route appears to cross furniture.
-- Removed the additional 0.3 m obstacle expansion. Unity carving already uses the baked agent radius. Obstacles now get a 0.03 m scan buffer, while the agent radius remains 0.3 m. See Unity's official NavMeshObstacle carving reference: https://docs.unity.com/en-us/engine/6000.3/script-reference/unityengine/ai/navmeshobstacle/carving
+- Removed the additional 0.3 m obstacle expansion. Unity carving already uses the baked agent radius. Obstacles now get a 0.03 m scan buffer; the latest headset-tuned agent-radius preset is 0.25 m. See Unity's official NavMeshObstacle carving reference: https://docs.unity.com/en-us/engine/6000.3/script-reference/unityengine/ai/navmeshobstacle/carving
 - The independent path guard now checks circular body clearance around rectangle corners rather than using square expanded corners, with a small tolerance for voxel edges. Valid corner turns should no longer be rejected solely by that square approximation.
 - Standing-position selection includes the projected object location, a nearest-floor proposal, denser rings and up to 2.2 m horizontal distance. Proposed goals may project onto nearby usable floor; the real starting position cannot snap across an obstacle.
 - Failure messages distinguish an off-map start, a start inside clearance, no nearby standing space, walls blocking views, and disconnected routes. Logs include obstacle counts, candidate counts and path corners for diagnosis.
@@ -34,7 +40,7 @@ Left **X** still toggles room outlines, while left **Y** reloads the room and cl
 ## How this works
 
 - MRUK SceneNavigation builds a mesh from the current room's floor only. Walking on tabletops, climbing and room-to-room links are excluded from this checkpoint.
-- The build uses a starting agent radius of 0.3 m, height 1.7 m, climb 0.04 m and slope 8 degrees.
+- The build uses a starting agent radius of 0.25 m, height 1.7 m, climb 0.04 m and slope 8 degrees.
 - Saved furniture and wall bounds create carving obstacles. Elevated furniture bounds extend down to the floor, avoiding routes underneath tables. Horizontal bounds have a 0.03 m scan buffer on each side, with body clearance applied through the agent radius.
 - After building, the component waits for Unity's obstacle carving to take effect. An additional segment/footprint check rejects paths that still cross reserved obstacle footprints.
 - Nearby standing positions are sampled around the target. Only complete paths to floor points within 2.2 m horizontally of the object are accepted. Candidates behind a mapped wall relative to the object are rejected.

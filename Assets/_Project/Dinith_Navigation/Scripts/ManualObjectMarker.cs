@@ -13,6 +13,21 @@ namespace SpatialSense.ManualDemo
         private Transform label;
         private Renderer markerRenderer;
         private MaterialPropertyBlock properties;
+        private Text nameText;
+        private string objectName = "My keys";
+        private string evidenceLabel = "Manually registered location";
+        public void SetEvidenceLabel(string value)
+        {
+            if (evidenceLabel == value) return;
+            evidenceLabel = value;
+            if (nameText != null) nameText.text = objectName + "\n" + evidenceLabel;
+        }
+
+        public void SetObjectName(string value)
+        {
+            objectName = value;
+            if (nameText != null) nameText.text = objectName + "\n" + evidenceLabel;
+        }
 
         public bool CanSelect => isActiveAndEnabled && owner != null && owner.CanConfirm;
 
@@ -30,8 +45,9 @@ namespace SpatialSense.ManualDemo
             labelObject.GetComponent<Canvas>().renderMode = RenderMode.WorldSpace;
             labelObject.GetComponent<RectTransform>().sizeDelta = new Vector2(450, 90);
             var text = ManualObjectDemo.AddText(labelObject.transform, "Name", font, 26, new Vector2(450, 90), Vector2.zero);
+            nameText = text;
             text.alignment = TextAnchor.MiddleCenter;
-            text.text = "My keys\nManually registered location";
+            SetObjectName(objectName);
             var outline = text.gameObject.AddComponent<Outline>();
             outline.effectColor = Color.black;
             outline.effectDistance = new Vector2(1.5f, -1.5f);
