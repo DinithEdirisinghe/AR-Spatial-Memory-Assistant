@@ -102,3 +102,14 @@ Quest checks required before handing the base to teammates:
 4. Opening the menu or reloading the room while the simulator is armed cancels that pending test input.
 5. The separated renderer shows the same route/arrows/ring and clears them on cancel, selection change or loss of tracking.
 6. Failure/state transitions appear in the diagnostics file. No new camera detector, clinical outcome or research novelty is established by this integration checkpoint.
+
+## Native application endpoint — v5
+
+The newer combined native room application runs in M1_LiveRoomScan. It creates NativeItemWorkflow at startup, available through LiveRoomScan.Items, implementing IObjectObservationSink, ISpatialObservationRegistry and IApplicationStateProvider. Use the typed observation contract above, but obtain its context from that workflow rather than the older SpatialApplicationHub instance. There is no real detector in this milestone. Existing shared/master demo scenes remain available as earlier checkpoints.
+
+See Assets/_Project/Dinith_Navigation/Native Item Finding.md for native menu/controller actions, ready/commit semantics, data compatibility and the full device test. Manual item registration uses a controller-side-grip action after choosing Register; A opens Meta capture and B exports the native room. UI and vision teammates should integrate against the new workflow after startup rather than depend on the old manual-demo UI component.
+# Dynamic navigation v7 integration note
+
+The combined M1_LiveRoomScan application keeps both scan methods. LiveScanNavigation retains a destination and RouteOwner while temporarily blocked; RouteAvailable becomes false and Status explains the blockage. NativeItemWorkflow remains in Searching and forwards that message. Dynamic updates can choose another standing point for the same saved item, so UI consumers should read StandingPosition again rather than caching the original endpoint. Room/source/selection changes still cancel guidance. No item record or anchor moves because furniture blocks the path.
+
+Presentation can read LiveSummary and LiveMeasurements and control ToggleLive, ToggleLiveOverlay and ResetLiveMeasurements. Monitoring, visualisation and manual block reset are separate actions. Do not automatically clear live blocks when hiding their overlay or turning monitoring off. Test/source/revision-grouped diagnostics describe observed confirmation and route response, not physical ground truth. The original observation sink, spatial registry and application-state contracts are unchanged. See Assets/_Project/Dinith_Navigation/Dynamic Routing.md for the practical test protocol and limits.

@@ -14,6 +14,11 @@ namespace SpatialSense.Persistence
     {
         [SerializeField] private RoomUnderstandingDemo roomDemo;
         [SerializeField] private ManualObjectDemo objectDemo;
+        private SpatialSense.RoomScan.MetaRoomSource nativeRoom;
+        private bool RoomReady => nativeRoom != null ? nativeRoom.Ready : roomDemo != null && roomDemo.IsRoomReady;
+        private Guid RoomUuid => nativeRoom != null ? nativeRoom.RoomUuid : roomDemo != null && roomDemo.CurrentRoom != null ? roomDemo.CurrentRoom.Anchor.Uuid : Guid.Empty;
+        private int RoomRevision => nativeRoom != null ? nativeRoom.Revision : roomDemo != null ? roomDemo.RoomRevision : -1;
+        public bool IsInitialized => started;
         [SerializeField] private string objectName = "My keys";
         [SerializeField] private bool selected = true;
         private SavedObjectRecord record;
@@ -37,7 +42,7 @@ namespace SpatialSense.Persistence
         public ObjectLocationState Availability => IsBusy ? busyLabel == "Saving" ? ObjectLocationState.Saving
             : busyLabel == "Removing" ? ObjectLocationState.Removing : ObjectLocationState.Locating
             : pendingDeletion != Guid.Empty ? ObjectLocationState.CleanupPending : record == null ? ObjectLocationState.NotSaved
-            : !roomDemo.IsRoomReady ? ObjectLocationState.WaitingForRoom : !RoomMatches() || !restoreAllowed ? ObjectLocationState.Unavailable
+            : !RoomReady ? ObjectLocationState.WaitingForRoom : !RoomMatches() || !restoreAllowed ? ObjectLocationState.Unavailable
             : HasLocatedPosition ? ObjectLocationState.Ready : activeAnchor != null ? ObjectLocationState.Locating : ObjectLocationState.Saved;
 
         public bool TryGetStoredObservation(out ObjectObservation observation)
@@ -60,7 +65,7 @@ namespace SpatialSense.Persistence
 
         public bool TryRegisterObservation(ObjectObservation observation)
         {
-            if (!started || IsBusy || !roomDemo.IsRoomReady || ObservationPolicy.NameFor(observation.ObjectId) != objectName) return false;
+            if (!started || IsBusy || !RoomReady || ObservationPolicy.NameFor(observation.ObjectId) != objectName) return false;
             pendingObservation = observation;
             externalSave = true;
             RegisterAndSave(observation.WorldPosition);
@@ -71,15 +76,16 @@ namespace SpatialSense.Persistence
         public string ObjectName => objectName;
         public bool TryGetLocatedPosition(out Vector3 position)
         {
-            position = HasLocatedPosition ? activeAnchor.transform.position : default;
-            return HasLocatedPosition;
+            if (!HasLocatedPosition) { position = default; return false; }
+            position = activeAnchor.transform.position;
+            return true;
         }
         public bool HasSavedRecord => record != null;
         public bool CanForget => started && !IsBusy && (record != null || pendingDeletion != Guid.Empty);
         public string ForgetToken => record != null ? record.anchorUuid : pendingDeletion.ToString("D");
         public string ListStatus => IsBusy ? busyLabel : HasLocatedPosition ? "Ready"
             : pendingDeletion != Guid.Empty ? "Removed - cleanup pending"
-            : record == null ? "Not saved" : !roomDemo.IsRoomReady ? "Waiting for room"
+            : record == null ? "Not saved" : !RoomReady ? "Waiting for room"
             : !RoomMatches() ? "Unavailable in this room" : !restoreAllowed ? "Unavailable - retry"
             : activeAnchor != null ? "Locating" : "Saved - select to locate";
 
@@ -107,9 +113,15 @@ namespace SpatialSense.Persistence
             objectDemo = objects;
         }
 
+        public void ConfigureForNative(SpatialSense.RoomScan.MetaRoomSource source, string name, bool isSelected)
+        {
+            nativeRoom = source;
+            ConfigureSlot(name, isSelected);
+        }
+
         private void Start()
         {
-            if (roomDemo == null || objectDemo == null)
+            if (nativeRoom == null && (roomDemo == null || objectDemo == null))
             {
                 Debug.LogError("[SpatialSense Memory] Run SpatialSense > Create Saved Object Demo.", this);
                 enabled = false;
@@ -122,7 +134,7 @@ namespace SpatialSense.Persistence
 
         private void Update()
         {
-            if (!started || !selected || !objectDemo.IsInitialized) return;
+            if (!started || !selected || (objectDemo != null && !objectDemo.IsInitialized)) return;
             if (IsBusy)
             {
                 if (!slowOperationReported && Time.unscaledTime - operationStarted > 30f)
@@ -135,16 +147,16 @@ namespace SpatialSense.Persistence
             if (HasLocatedPosition)
             {
                 if (!wasUsable) SetStatus($"{objectName} ready. Press B to find it, or A to replace its saved location.");
-                objectDemo.ApplyAnchoredPosition(activeAnchor.transform.position);
+                objectDemo?.ApplyAnchoredPosition(activeAnchor.transform.position);
                 wasUsable = true;
                 return;
             }
             if (wasUsable)
             {
                 wasUsable = false;
-                objectDemo.ClearRegistration();
+                objectDemo?.ClearRegistration();
             }
-            if (!roomDemo.IsRoomReady) return;
+            if (!RoomReady) return;
             if (record != null && !RoomMatches())
             {
                 SetStatus("This saved location belongs to another room scan. Return to that room, or press A to register and save here.");
@@ -161,8 +173,7 @@ namespace SpatialSense.Persistence
 
         private bool RoomMatches()
         {
-            return record != null && roomDemo != null && roomDemo.IsRoomReady
-                && roomDemo.CurrentRoom != null && record.roomUuid == roomDemo.CurrentRoom.Anchor.Uuid.ToString("D");
+            return record != null && RoomReady && RoomUuid != Guid.Empty && record.roomUuid == RoomUuid.ToString("D");
         }
 
         private void ReadRecord()
@@ -200,7 +211,7 @@ namespace SpatialSense.Persistence
 
         public async void RetryLoad()
         {
-            if (!started || !selected || IsBusy || !roomDemo.IsRoomReady) return;
+            if (!started || !selected || IsBusy || !RoomReady) return;
             if (record == null) ReadRecord();
             if (record == null) return;
             if (!RoomMatches())
@@ -266,9 +277,9 @@ namespace SpatialSense.Persistence
 
         public async void RegisterAndSave(Vector3 position)
         {
-            if (!started || (!selected && !externalSave) || IsBusy || !roomDemo.IsRoomReady || roomDemo.CurrentRoom == null) return;
-            var roomUuid = roomDemo.CurrentRoom.Anchor.Uuid;
-            var observationRevision = roomDemo.RoomRevision;
+            if (!started || (!selected && !externalSave) || IsBusy || !RoomReady || RoomUuid == Guid.Empty) return;
+            var roomUuid = RoomUuid;
+            var observationRevision = RoomRevision;
             if (roomUuid == Guid.Empty)
             {
                 SetStatus("Room identity is unavailable. Reload the room with left Y before saving.");
@@ -289,14 +300,14 @@ namespace SpatialSense.Persistence
                 candidate = anchorObject.AddComponent<OVRSpatialAnchor>();
                 if (!await WaitForTrackedPose(candidate, 25f)) throw new InvalidOperationException("New anchor could not be created and tracked.");
                 if (this == null) return;
-                if (pendingObservation.HasValue && roomDemo.RoomRevision != observationRevision)
+                if (pendingObservation.HasValue && RoomRevision != observationRevision)
                     throw new InvalidOperationException("Coordinate frame changed while creating the observation anchor.");
                 var result = await candidate.SaveAnchorAsync();
                 persisted = result.Success;
                 if (this == null) return;
                 if (!persisted) throw new InvalidOperationException($"Native anchor save failed ({result.Status}).");
-                if (!roomDemo.IsRoomReady || roomDemo.CurrentRoom.Anchor.Uuid != roomUuid
-                    || (pendingObservation.HasValue && roomDemo.RoomRevision != observationRevision))
+                if (!RoomReady || RoomUuid != roomUuid
+                    || (pendingObservation.HasValue && RoomRevision != observationRevision))
                     throw new InvalidOperationException("Room changed during save. Previous saved location retained.");
                 var replacement = new SavedObjectRecord
                 {
@@ -398,7 +409,7 @@ namespace SpatialSense.Persistence
             slowOperationReported = false;
             wasUsable = false;
             busyLabel = label;
-            if (selected) objectDemo.ClearRegistration();
+            if (selected) objectDemo?.ClearRegistration();
             SetStatus(message);
         }
 
