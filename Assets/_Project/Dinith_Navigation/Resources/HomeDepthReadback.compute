@@ -1,0 +1,24 @@
+#pragma kernel CaptureHomeDepth
+
+// Read the public Environment Depth texture using its matching reprojection
+// matrix. Store anchor-local coordinates now, not after asynchronous readback.
+Texture2DArray<float> _HomeDepth;
+RWStructuredBuffer<float4> _HomePoints;
+float4x4 _HomeClipToLocal;
+float4 _HomeHeadLocal;
+int _HomeTextureSize;
+
+[numthreads(8,8,1)]
+void CaptureHomeDepth(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= 48 || id.y >= 48) return;
+    uint2 pixel = min((uint2)((float2(id.xy) + 0.5) * _HomeTextureSize / 48.0), (uint)(_HomeTextureSize - 1));
+    float raw = _HomeDepth.Load(int4(pixel,0,0));
+    float2 uv = (float2(pixel) + 0.5) / _HomeTextureSize;
+    float4 h = mul(_HomeClipToLocal, float4(uv * 2 - 1, raw * 2 - 1, 1));
+    float3 localPosition = h.xyz / h.w;
+    float range = length(localPosition - _HomeHeadLocal.xyz);
+    bool valid = raw > 0.000001 && raw < 0.999999 && abs(h.w) > 0.000001
+        && all(isfinite(localPosition)) && range >= 0.3 && range <= 3.5;
+    _HomePoints[id.x + id.y * 48] = valid ? float4(localPosition,1) : float4(0,0,0,0);
+}

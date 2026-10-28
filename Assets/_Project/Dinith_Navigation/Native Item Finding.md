@@ -1,12 +1,12 @@
-# Find my items — current v7
+# Find my items — current v10
 
-Current build title: **SpatialSense | Dynamic routing v7**. See [Dynamic Routing.md](Dynamic%20Routing.md) for live obstacle feedback, automatic rerouting, recovery and measurements. Both scan methods and the v6 guidance fix below remain included. The v5 notes describe the original combined item workflow retained in this build.
+Current build title: **SpatialSense | Connected rooms v10.1**. See [Connected Rooms.md](Connected%20Rooms.md) for doorway teaching and finding items across rooms, [Evaluation Lab.md](Evaluation%20Lab.md) for single-room comparison trials and CSV results, and [Moved Furniture Updates.md](Moved%20Furniture%20Updates.md) for old furniture corrections. Both scan methods and existing item memory remain included. The v5 notes below describe the original combined workflow.
 
 This milestone combines the native Meta room scanner, room navigation and persistent Keys/Wallet/Remote locations in the existing `M1_LiveRoomScan` scene. The app creates the additional components automatically at startup. No scene recreation, manual Inspector assignments or new package installation is required for an existing working native capture scene.
 
 ## One build and the main headset test
 
-1. Build the existing `M1_LiveRoomScan` scene once. The title should be **SpatialSense | Dynamic routing v7**.
+1. Build the existing `M1_LiveRoomScan` scene once. The title should be **SpatialSense | Connected rooms v10.1**.
 2. On Scan, complete **Scan room with Meta**, or explicitly **Load previous Meta room**. Wait for the room to locate and its walking map to finish building.
 3. Open **Items**, select **Keys**, and choose **Register / update**. The menu closes.
 4. Hold the right controller beside the real keys. Release and squeeze the **right side grip**. This is not the index trigger or A/B. Wait for the saved confirmation.

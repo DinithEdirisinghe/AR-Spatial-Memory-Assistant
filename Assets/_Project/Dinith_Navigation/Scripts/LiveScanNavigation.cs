@@ -22,6 +22,24 @@ namespace SpatialSense.RoomScan
         public bool AppHasFloor => appHasFloor;
         public float AppFloorY => appFloorY;
         private LiveObstacleLayer liveLayer;
+        private BaselineFurnitureLayer furnitureLayer;
+        private int furnitureFocus, furnitureProbeCursor, semanticRevision = -1, sampleCategory, lastQueryCount = 24;
+        private float furnitureFocusUntil;
+        public bool FurnitureUpdatesEnabled { get; private set; } = true;
+        public event Action<NavigationTrialSignal> TrialSignal;
+        public bool LiveRequested => liveRequested;
+        public bool EvaluationReady => HasFloor && map != null && RoomReady;
+        public int EvaluationMapGeneration => buildGeneration;
+        public int EvaluationSourceRevision => CurrentRevision;
+        public int EvaluationSemanticRevision => roomSource.Revision;
+        public int EvaluationFloorCells => map?.WalkableCount ?? 0;
+        public int EvaluationFurnitureCandidates => furnitureLayer?.CandidateCount ?? 0;
+        public double PlannedRouteMetres { get; private set; } = -1;
+        private bool gotLiveDepth;
+        public bool RecentLiveDepth => LiveEnabled && gotLiveDepth && Time.unscaledTime - lastDepthAt <= 3f;
+        public string FurnitureSummary => furnitureLayer == null ? "Build a walking map first." :
+            $"Furniture updates {(FurnitureUpdatesEnabled ? "ON" : "OFF")} | verified {furnitureLayer.ClearedCount}/{furnitureLayer.CandidateCount} cells"
+            + (furnitureLayer.AtCapacity ? " | check capacity reached" : furnitureLayer.CandidateCount == 0 ? "\nNo classified furniture with captured floor support. Load Meta room data and rebuild." : "\nLook at the old space and its floor. Walls and unknown surfaces remain protected.");
         private readonly List<DepthObservationRay> liveRays = new List<DepthObservationRay>();
         private float nextLiveCheck;
         private ApplicationDiagnostics diagnostics;
@@ -36,6 +54,9 @@ namespace SpatialSense.RoomScan
         private GameObject liveRoot;
         private Mesh liveMesh;
         private Material liveMaterial;
+        private GameObject furnitureRoot;
+        private Mesh furnitureMesh;
+        private Material furnitureMaterial;
         public bool LiveOverlayVisible { get; private set; } = true;
         public string LiveSummary => !LiveEnabled ? "Dynamic routing OFF; confirmed live blocks remain." :
             $"Dynamic ON | new blocks {liveLayer?.ActiveCount ?? 0} | checking {liveLayer?.PendingCount ?? 0}"
@@ -46,6 +67,7 @@ namespace SpatialSense.RoomScan
         {
             public string scanMethod, testId;
             public int activeCells, addedCells, clearedCells, validRays, obstacleRevision, routeGeneration;
+            public int furnitureCandidates, verifiedFurnitureCells, reopenedLastBatch, restoredLastBatch;
             public float extraMargin, responseMs, samplingMs;
             public double observedToConfirmedMs;
         }
@@ -91,7 +113,9 @@ namespace SpatialSense.RoomScan
             scanner = source; rig = cameraRig; baseMaterial = material; roomSource = metaRoom;
             diagnostics = gameObject.GetComponent<ApplicationDiagnostics>() ?? gameObject.AddComponent<ApplicationDiagnostics>();
             liveRequested = PlayerPrefs.GetInt("SpatialSense.DynamicRouting", 1) != 0;
+            FurnitureUpdatesEnabled = PlayerPrefs.GetInt("SpatialSense.FurnitureUpdates", 1) != 0;
             liveMaterial = new Material(baseMaterial); liveMaterial.SetColor("_BaseColor", new Color(1f, 0.1f, 0.75f, 0.8f));
+            furnitureMaterial = new Material(baseMaterial); furnitureMaterial.SetColor("_BaseColor", new Color(0.05f, 0.65f, 1f, 1f));
             var preferred = PlayerPrefs.GetFloat("SpatialSense.ExtraObstacleMargin", 0.03f);
             foreach (var option in MarginOptions) if (Mathf.Abs(preferred - option) < 0.001f) Clearance = option;
             routeMaterial = MakeMaterial(new Color(0.12f, 0.45f, 1f, 1f));
@@ -105,8 +129,14 @@ namespace SpatialSense.RoomScan
         private void Update()
         {
             if (scanner == null) return;
-            if (sourceRevision != CurrentRevision)
-            { sourceRevision = CurrentRevision; ClearMap(); Status = scanner.Summary; }
+            if(scanner.Home!=null && scanner.Home.Active)
+            {
+                if(mapRoot!=null)mapRoot.SetActive(false);if(routeRoot!=null)routeRoot.SetActive(false);
+                if(liveRoot!=null)liveRoot.SetActive(false);if(furnitureRoot!=null)furnitureRoot.SetActive(false);
+                return;
+            }
+            if (sourceRevision != CurrentRevision || (AppMode && semanticRevision != roomSource.Revision))
+            { sourceRevision = CurrentRevision; semanticRevision = roomSource.Revision; attemptedRevision = -1; ClearMap(); Status = scanner.Summary; }
             if (map != null && !RoomReady)
             { ClearMap(); attemptedRevision = -1; Status = "Scan tracking unavailable. Guidance cleared; locate the scan again."; }
             if (HasFloor && !scanner.IsScanning && map == null && !scanner.IsWorking && attemptedRevision != sourceRevision)
@@ -114,6 +144,7 @@ namespace SpatialSense.RoomScan
             if (mapRoot != null) mapRoot.SetActive(MapVisible && RoomReady && OVRManager.hasVrFocus);
             if (routeRoot != null) routeRoot.SetActive(RoomReady && OVRManager.hasVrFocus);
             if (liveRoot != null) liveRoot.SetActive(LiveOverlayVisible && RoomReady && OVRManager.hasVrFocus);
+            if (furnitureRoot != null) furnitureRoot.SetActive((LiveOverlayVisible || MapVisible) && RoomReady && OVRManager.hasVrFocus);
             if (aim != AimMode.None)
             {
                 if (!RoomReady || scanner.MenuOpen || !OVRManager.hasVrFocus) { CancelAim(); return; }
@@ -203,7 +234,7 @@ namespace SpatialSense.RoomScan
             if (!HasFloor) { Status = AppMode ? "Capture/load an app scan, then set its floor first." : roomSource.Status; return; }
             scanner.PauseCapture();
             CancelAim(); ClearMap();
-            MeshPoint[] points; int[] indices; int floorIndices;
+            MeshPoint[] points; int[] indices; int floorIndices; bool[] furnitureTriangles;
             try
             {
                 if (AppMode)
@@ -213,22 +244,26 @@ namespace SpatialSense.RoomScan
                     indices = new int[scanner.CapturedTriangles.Count];
                     for (var i = 0; i < indices.Length; i++) indices[i] = scanner.CapturedTriangles[i];
                     floorIndices = -1;
+                    furnitureTriangles = roomSource.ClassifyAppFurniture(scanner.CapturedVertices, scanner.CapturedTriangles, Frame);
                 }
-                else roomSource.Snapshot(out points, out indices, out floorIndices);
+                else roomSource.Snapshot(out points, out indices, out floorIndices, out furnitureTriangles);
             }
             catch (Exception error) { Status = "Could not read " + scanner.ScanMethodName + " geometry: " + error.Message; return; }
             var generation = ++buildGeneration;
             buildCancellation = new CancellationTokenSource();
             var token = buildCancellation.Token;
             var height = FloorY; var clearance = Clearance; var revision = CurrentRevision;
+            var semantics = roomSource.Revision;
             var strict = !AppMode || StrictCoverage;
             IsBuilding = true; Status = "Building routes from " + scanner.ScanMethodName + "...";
             try
             {
-                var result = await Task.Run(() => ScanNavigationGrid.Build(points, indices, height, clearance, token, strict, floorIndices), token);
-                if (this == null || token.IsCancellationRequested || generation != buildGeneration || !RoomReady || revision != CurrentRevision) return;
+                var result = await Task.Run(() => ScanNavigationGrid.Build(points, indices, height, clearance, token, strict, floorIndices, furnitureTriangles), token);
+                if (this == null || token.IsCancellationRequested || generation != buildGeneration || !RoomReady || revision != CurrentRevision || semantics != roomSource.Revision) return;
                 map = result;
+                semanticRevision = semantics;
                 liveLayer = new LiveObstacleLayer(map);
+                furnitureLayer = new BaselineFurnitureLayer(map);
                 CreateMapVisual();
                 if (showMap) { MapVisible = true; scanner.ShowFloorMap(); }
                 Status = map.WalkableCount == 0 ? "No route area yet. Red: obstacle. Orange: extra margin. Purple: floor edge. Check counts below."
@@ -271,7 +306,12 @@ namespace SpatialSense.RoomScan
         {
             scanner.NotifyScanChanged();
             if (resetFloor) appHasFloor = false;
-            if (AppMode) { sourceRevision = CurrentRevision; attemptedRevision = -1; ClearMap(); }
+            if (AppMode)
+            {
+                sourceRevision = CurrentRevision; attemptedRevision = -1; ClearMap();
+                Status=scanner.IsScanning?"Live mesh is updating. Pause capture, set the floor, then rebuild its walking map."
+                    :"App scan changed. Set/check its floor, then rebuild the walking map.";
+            }
         }
 
         public void SourceChanged()
@@ -279,11 +319,59 @@ namespace SpatialSense.RoomScan
             ClearMap(); sourceRevision = CurrentRevision; attemptedRevision = -1;
             Status = "Using " + scanner.ScanMethodName + ". Walking maps use only the selected source.";
         }
+        public bool TryCaptureDoorPoint(out Vector3 world)
+        {
+            world=default;
+            if(AppMode || !EvaluationReady) return false;
+            var p=Frame.InverseTransformPoint(rig.centerEyeAnchor.position); var cell=map.Index(p.x,p.z);
+            if(cell<0 || map.Cells[cell]!=2 || map.OriginalCell(cell)!=2) return false;
+            var centre=map.Centre(cell); world=Frame.TransformPoint(new Vector3(centre.X,FloorY,centre.Z)); return true;
+        }
+        public bool TryCaptureRoomRouteMap(out RoomGraphMap snapshot,out MeshPoint head)
+        {
+            snapshot=null; head=default;
+            if(AppMode || !EvaluationReady) return false;
+            var p=Frame.InverseTransformPoint(rig.centerEyeAnchor.position); head=new MeshPoint(p.x,FloorY,p.z);
+            snapshot=new RoomGraphMap { RoomId=roomSource.RoomUuid.ToString("D"),FloorId=roomSource.FloorUuid.ToString("D"),LayoutId=roomSource.LayoutId,
+                Map=map.RoutingSnapshot(),FromFloor=roomSource.CurrentFromFloor }; return true;
+        }
+        public bool SetDoorwayDestination(string owner,RoomDoorEndpoint endpoint,out string reason)
+        {
+            reason="The current room's Meta floor map is not ready.";
+            if(AppMode || !EvaluationReady || !roomSource.TryResolveDoor(endpoint,out var world)) return false;
+            var start=Frame.InverseTransformPoint(rig.centerEyeAnchor.position); var point=Frame.InverseTransformPoint(world);
+            if(!map.TryRoute(start.x,start.z,point.x,point.z,out _,out reason)) return false;
+            ClearRoute(); var cell=map.Index(point.x,point.z); goal=map.Centre(cell); hasGoal=true; RouteOwner=owner;
+            EnsureRouteVisual(); PlanRoute(); reason=Status; return RouteAvailable;
+        }
+
+        public void PrepareEvaluationMode(NavigationTrialMode mode)
+        {
+            ClearMap(); liveRequested = mode != NavigationTrialMode.FixedMap;
+            FurnitureUpdatesEnabled = mode == NavigationTrialMode.FurnitureUpdates;
+            BuildMap();
+        }
+        public void RestoreEvaluationSettings(bool dynamicRequested, bool furnitureEnabled)
+        {
+            ClearMap(); liveRequested = dynamicRequested; FurnitureUpdatesEnabled = furnitureEnabled; attemptedRevision = -1;
+            if (HasFloor && !scanner.IsWorking) BuildMap();
+        }
+        public void ResetEvaluationEvidence()
+        {
+            if (map == null) return;
+            ClearRoute();
+            for (var i = 0; i < map.CellCount; i++) if (map.CanRefreshFurniture(i)) map.SetFurnitureCleared(i, false);
+            map.RebuildFurnitureBaseline(Clearance);
+            liveLayer = new LiveObstacleLayer(map); furnitureLayer = new BaselineFurnitureLayer(map);
+            map.ApplyLiveObstacles(liveLayer.ActivePoints(), Clearance); obstacleRevision++; gotLiveDepth = false;
+            RefreshLiveVisual();
+        }
 
         public void ClearRoute()
         {
             itemPlanningCancellation?.Cancel();
             routeGeneration++; RouteOwner = null; RouteAvailable = false;
+            PlannedRouteMetres = -1;
             hasGoal = false; hasItemTarget = false; liveReplanPending = routeWasBlocked = false; lastPathHash = 0; CancelAim();
             if (route != null) route.positionCount = 0;
             if (marker != null) marker.enabled = false;
@@ -350,6 +438,10 @@ namespace SpatialSense.RoomScan
             { recoveredEvents++; RecordLive("route_recovered"); }
             routeWasBlocked = false;
             RouteAvailable = true;
+            double length = 0;
+            for (var i = 1; i < points.Count; i++)
+            { var dx = points[i].X - points[i-1].X; var dz = points[i].Z - points[i-1].Z; length += Math.Sqrt(dx * dx + dz * dz); }
+            PlannedRouteMetres = length;
             route.positionCount = points.Count;
             for (var i = 0; i < points.Count; i++) route.SetPosition(i, new Vector3(points[i].X, points[i].Y, points[i].Z));
             var target = map.Centre(map.Index(goal.X, goal.Z));
@@ -361,7 +453,7 @@ namespace SpatialSense.RoomScan
                 : "Route: " + scanner.ScanMethodName + (LiveEnabled ? " + live obstacle checks." : ". Live obstacle checks OFF.");
             ulong hash = 1469598103934665603UL;
             foreach (var point in points) { hash ^= (uint)map.Index(point.X, point.Z); hash = unchecked(hash * 1099511628211UL); }
-            if (liveReplanPending && lastPathHash != 0 && hash != lastPathHash) routeUpdates++;
+            if (liveReplanPending && lastPathHash != 0 && hash != lastPathHash) { routeUpdates++; RecordLive("route_shape_changed"); }
             lastPathHash = hash;
             FinishLiveResponse(true);
         }
@@ -369,6 +461,7 @@ namespace SpatialSense.RoomScan
         private void SetRouteBlocked(string reason)
         {
             route.positionCount = 0; marker.enabled = false; RouteAvailable = false;
+            PlannedRouteMetres = -1;
             if (!routeWasBlocked) { blockedEvents++; RecordLive("route_blocked"); }
             routeWasBlocked = true;
             Status = "Route blocked. " + reason + (LiveEnabled ? " Looking for another route; observe the cleared space after removing an obstruction." : " Dynamic checks are OFF.");
@@ -414,13 +507,19 @@ namespace SpatialSense.RoomScan
 
         private void RecordLive(string eventName)
         {
+            TrialSignal?.Invoke(new NavigationTrialSignal { Name = eventName, Revision = obstacleRevision,
+                Added = liveLayer?.AddedLastBatch ?? 0, Cleared = liveLayer?.ClearedLastBatch ?? 0,
+                Reopened = furnitureLayer?.ClearedLastBatch ?? 0, Restored = furnitureLayer?.RestoredLastBatch ?? 0,
+                ConfirmationMs = liveLayer?.LastConfirmationDelayMs ?? -1, ResponseMs = lastResponseMs });
             diagnostics?.Record(eventName, RouteOwner, JsonUtility.ToJson(new LiveMeasure
             {
                 scanMethod = scanner.ScanMethodName, testId = testId, obstacleRevision = obstacleRevision, routeGeneration = routeGeneration,
                 activeCells = liveLayer?.ActiveCount ?? 0,
                 addedCells = liveLayer?.AddedLastBatch ?? 0, clearedCells = liveLayer?.ClearedLastBatch ?? 0,
                 validRays = lastRayCount, extraMargin = Clearance, responseMs = lastResponseMs, samplingMs = lastSamplingMs,
-                observedToConfirmedMs = liveLayer?.LastConfirmationDelayMs ?? -1
+                observedToConfirmedMs = liveLayer?.LastConfirmationDelayMs ?? -1,
+                furnitureCandidates = furnitureLayer?.CandidateCount ?? 0, verifiedFurnitureCells = furnitureLayer?.ClearedCount ?? 0,
+                reopenedLastBatch = furnitureLayer?.ClearedLastBatch ?? 0, restoredLastBatch = furnitureLayer?.RestoredLastBatch ?? 0
             }));
         }
 
@@ -470,7 +569,10 @@ namespace SpatialSense.RoomScan
         }
         private void ClearMap()
         {
-            LiveEnabled = false; liveLayer = null; scanner?.DisableProbeDepth();
+            LiveEnabled = false; liveLayer = null; furnitureLayer = null; scanner?.DisableProbeDepth();
+            if (furnitureRoot != null) Destroy(furnitureRoot);
+            if (furnitureMesh != null) Destroy(furnitureMesh);
+            furnitureRoot = null; furnitureMesh = null; furnitureFocus = furnitureProbeCursor = sampleCategory = 0; furnitureFocusUntil = 0;
             if (liveRoot != null) Destroy(liveRoot);
             if (liveMesh != null) Destroy(liveMesh);
             liveRoot = null; liveMesh = null; targetCursor = sweepCursor = 0;
@@ -504,11 +606,24 @@ namespace SpatialSense.RoomScan
         {
             if (!scanner.EnableDepthForProbe())
             { LiveEnabled = false; Status = "Dynamic depth unavailable. Check spatial-data permission and try Dynamic routing again."; return; }
-            LiveEnabled = true; nextLiveCheck = 0; lastDepthAt = Time.unscaledTime;
+            LiveEnabled = true; nextLiveCheck = 0; lastDepthAt = Time.unscaledTime; gotLiveDepth = false;
             Status = "Dynamic checks ON. Look toward changed furniture; magenta tiles mark confirmed new obstacles.";
         }
         public void ToggleLiveOverlay()
         { LiveOverlayVisible = !LiveOverlayVisible; }
+        public void ToggleFurnitureUpdates()
+        {
+            if (map == null) return;
+            FurnitureUpdatesEnabled = !FurnitureUpdatesEnabled;
+            PlayerPrefs.SetInt("SpatialSense.FurnitureUpdates", FurnitureUpdatesEnabled ? 1 : 0); PlayerPrefs.Save();
+            for (var i = 0; i < map.CellCount; i++) if (map.CanRefreshFurniture(i)) map.SetFurnitureCleared(i, false);
+            furnitureLayer = new BaselineFurnitureLayer(map); map.RebuildFurnitureBaseline(Clearance);
+            map.ApplyLiveObstacles(liveLayer.ActivePoints(), Clearance); obstacleRevision++;
+            RefreshLiveVisual(); if (hasGoal) PlanRoute();
+            RecordLive(FurnitureUpdatesEnabled ? "furniture_updates_enabled" : "furniture_updates_disabled");
+            Status = FurnitureUpdatesEnabled ? "Furniture verification ON. Look through the old furniture space and down at its floor."
+                : "Furniture updates OFF. Original furniture restrictions restored.";
+        }
         public void ResetLiveMeasurements()
         {
             routeUpdates = blockedEvents = recoveredEvents = 0; lastResponseMs = -1;
@@ -542,6 +657,30 @@ namespace SpatialSense.RoomScan
             }
             liveMesh.Clear(); liveMesh.SetVertices(vertices); liveMesh.SetTriangles(triangles, 0); liveMesh.RecalculateBounds();
             liveRoot.SetActive(LiveOverlayVisible && RoomReady && OVRManager.hasVrFocus);
+            RefreshFurnitureVisual();
+        }
+        private void RefreshFurnitureVisual()
+        {
+            if (furnitureRoot == null)
+            {
+                furnitureRoot = new GameObject("Verified old furniture space - blue", typeof(MeshFilter), typeof(MeshRenderer));
+                furnitureRoot.transform.SetParent(Frame, false);
+                furnitureMesh = new Mesh { indexFormat = IndexFormat.UInt32 }; furnitureMesh.MarkDynamic();
+                furnitureRoot.GetComponent<MeshFilter>().sharedMesh = furnitureMesh;
+                var renderer = furnitureRoot.GetComponent<MeshRenderer>(); renderer.sharedMaterial = furnitureMaterial;
+                renderer.shadowCastingMode = ShadowCastingMode.Off; renderer.receiveShadows = false;
+            }
+            var vertices = new List<Vector3>(); var triangles = new List<int>();
+            for (var i = 0; i < map.CellCount; i++)
+            {
+                if (map.OriginalCell(i) == 2 || map.Cells[i] != 2) continue;
+                var p = map.Centre(i); var half = ScanNavigationGrid.CellSize * 0.47f; var offset = vertices.Count;
+                vertices.Add(new Vector3(p.X - half, FloorY + 0.06f, p.Z - half)); vertices.Add(new Vector3(p.X + half, FloorY + 0.06f, p.Z - half));
+                vertices.Add(new Vector3(p.X + half, FloorY + 0.06f, p.Z + half)); vertices.Add(new Vector3(p.X - half, FloorY + 0.06f, p.Z + half));
+                triangles.AddRange(new[] { offset, offset + 2, offset + 1, offset, offset + 3, offset + 2 });
+            }
+            furnitureMesh.Clear(); furnitureMesh.SetVertices(vertices); furnitureMesh.SetTriangles(triangles, 0); furnitureMesh.RecalculateBounds();
+            furnitureRoot.SetActive((LiveOverlayVisible || MapVisible) && RoomReady && OVRManager.hasVrFocus);
         }
         public void ClearLiveLayer()
         {
@@ -557,10 +696,14 @@ namespace SpatialSense.RoomScan
             liveRays.Clear(); var head = rig.centerEyeAnchor;
             var origin = Frame.InverseTransformPoint(head.position);
             var clock = System.Diagnostics.Stopwatch.StartNew();
+            var queries = 0;
             for (var query = 0; query < 24; query++)
             {
                 Vector3 direction;
-                if (query % 4 == 0 && liveLayer.TrackedCount > 0 && TryEvidenceDirection(head, out var targetDirection))
+                var category = sampleCategory; sampleCategory = (sampleCategory + 1) % 4; queries++;
+                if (category == 1 && FurnitureUpdatesEnabled && furnitureLayer.CandidateCount > 0 && TryFurnitureDirection(head, out var furnitureDirection))
+                    direction = furnitureDirection;
+                else if (category == 0 && liveLayer.TrackedCount > 0 && TryEvidenceDirection(head, out var targetDirection))
                     direction = targetDirection;
                 else
                 {
@@ -569,25 +712,72 @@ namespace SpatialSense.RoomScan
                     var index = sweepCursor; sweepCursor = (sweepCursor + 37) % 96;
                     direction = head.rotation * new Vector3(Mathf.Lerp(-0.55f, 0.55f, (index % 12) / 11f), Mathf.Lerp(-0.5f, 0.4f, (index / 12) / 7f), 1).normalized;
                 }
-                if (scanner.TryProbe(new Ray(head.position, direction), out var point, out _))
+                if (scanner.TryProbe(new Ray(head.position, direction), out var point, out var normal))
                 {
                     // Avoid treating very near controller/headset returns as
                     // room furniture. Floor-height rejection happens in layer.
                     var distance = Vector3.Distance(head.position, point);
                     if (distance >= 0.4f && distance <= 3.5f)
-                    { var p = Frame.InverseTransformPoint(point); liveRays.Add(new DepthObservationRay(new MeshPoint(origin.x, origin.y, origin.z), new MeshPoint(p.x, p.y, p.z))); }
+                    {
+                        var p = Frame.InverseTransformPoint(point); var n = Frame.InverseTransformDirection(normal);
+                        liveRays.Add(new DepthObservationRay(new MeshPoint(origin.x, origin.y, origin.z), new MeshPoint(p.x, p.y, p.z), new MeshPoint(n.x, n.y, n.z)));
+                    }
                 }
                 if (clock.Elapsed.TotalMilliseconds > 3) break;
             }
-            lastSamplingMs = (float)clock.Elapsed.TotalMilliseconds; lastRayCount = liveRays.Count;
-            if (lastRayCount > 0) lastDepthAt = Time.unscaledTime;
-            if (!liveLayer.Observe(liveRays, Time.realtimeSinceStartupAsDouble)) return;
+            lastSamplingMs = (float)clock.Elapsed.TotalMilliseconds; lastRayCount = liveRays.Count; lastQueryCount = queries;
+            if (lastRayCount > 0) { lastDepthAt = Time.unscaledTime; gotLiveDepth = true; }
+            var now = Time.realtimeSinceStartupAsDouble;
+            var furnitureChanged = FurnitureUpdatesEnabled && furnitureLayer.Observe(liveRays, now);
+            var liveChanged = liveLayer.Observe(liveRays, now);
+            if (!furnitureChanged && !liveChanged) return;
             liveChangeAt = Time.realtimeSinceStartupAsDouble; liveReplanPending = hasGoal; lastResponseMs = -1;
+            if (furnitureChanged) map.RebuildFurnitureBaseline(Clearance);
             map.ApplyLiveObstacles(liveLayer.ActivePoints(), Clearance);
             obstacleRevision++;
             RefreshLiveVisual();
             RecordLive("live_obstacle_change");
+            if (furnitureChanged) RecordLive("baseline_furniture_changed");
             if (hasGoal) PlanRoute();
+        }
+        private bool TryFurnitureDirection(Transform head, out Vector3 direction)
+        {
+            direction = default;
+            var size = Math.Min(lastQueryCount >= 12 ? 4 : 1, furnitureLayer.CandidateCount);
+            var triedInGroup = 0;
+            for (var attempt = 0; attempt < 64; attempt++)
+            {
+                var probes = 0; var complete = true;
+                for (var offset = 0; offset < size; offset++)
+                {
+                    var index = (furnitureFocus + offset) % furnitureLayer.CandidateCount;
+                    probes += furnitureLayer.ProbeCount(index);
+                    if (!map.FurnitureCleared(furnitureLayer.CandidateCell(index))) complete = false;
+                }
+                if (complete || Time.unscaledTime >= furnitureFocusUntil || triedInGroup >= probes)
+                {
+                    furnitureFocus = (furnitureFocus + size) % furnitureLayer.CandidateCount; furnitureProbeCursor = 0;
+                    furnitureFocusUntil = Time.unscaledTime + 3f; triedInGroup = 0;
+                    continue;
+                }
+                // Revisit a small group until verified (or its time slice ends),
+                // rather than letting one room-wide sweep age out every proof.
+                var slot = furnitureProbeCursor++ % probes; triedInGroup++;
+                var candidate = furnitureFocus;
+                for (var offset = 0; offset < size; offset++)
+                {
+                    candidate = (furnitureFocus + offset) % furnitureLayer.CandidateCount;
+                    var count = furnitureLayer.ProbeCount(candidate);
+                    if (slot < count) break;
+                    slot -= count;
+                }
+                if (map.FurnitureCleared(furnitureLayer.CandidateCell(candidate))) continue;
+                var p = furnitureLayer.ProbePoint(candidate, slot);
+                var world = Frame.TransformPoint(new Vector3(p.X, p.Y, p.Z)); var local = head.InverseTransformPoint(world);
+                if (local.z < 0.4f || local.sqrMagnitude > 3.5f * 3.5f || Mathf.Abs(local.x / local.z) > 0.55f || Mathf.Abs(local.y / local.z) > 0.5f) continue;
+                direction = (world - head.position).normalized; return true;
+            }
+            return false;
         }
         private bool TryEvidenceDirection(Transform head, out Vector3 direction)
         {
@@ -603,6 +793,6 @@ namespace SpatialSense.RoomScan
             return false;
         }
         private void OnDestroy()
-        { ClearMap(); if (liveMaterial != null) Destroy(liveMaterial); foreach (var material in materials) if (material != null) Destroy(material); }
+        { ClearMap(); if (liveMaterial != null) Destroy(liveMaterial); if (furnitureMaterial != null) Destroy(furnitureMaterial); foreach (var material in materials) if (material != null) Destroy(material); }
     }
 }

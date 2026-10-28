@@ -1,5 +1,7 @@
 # Dynamic routing v7
 
+**Current build is Evaluation lab v9.** See [Evaluation Lab.md](Evaluation%20Lab.md) for comparison trials and CSV exports. The v7 behavior below and [Moved Furniture Updates.md](Moved%20Furniture%20Updates.md) remain available. The historical restriction that all original furniture needs a rescan now applies to protected/unclassified geometry and unsupported floor.
+
 Build the existing **M1_LiveRoomScan** scene. Its title is now **SpatialSense | Dynamic routing v7**. No scene recreation or Inspector assignments are required. Both Meta room scanning and App live scanning remain available under **Scan > Method**.
 
 ## What this build adds

@@ -19,23 +19,36 @@ namespace SpatialSense.RoomScan
         public int CoverageEdgeCount { get; private set; }
         public int CellCount => Width * Height;
         private byte[] baseCells;
+        private byte[] originalCells, floorCells;
+        private bool[] furniture, permanent, furnitureCleared;
+        private float[] furnitureLow, furnitureHigh;
+        public byte OriginalCell(int index) => originalCells[index];
+        public bool CanRefreshFurniture(int index) => furniture != null && furniture[index] && !permanent[index] && floorCells[index] != 0;
+        public float FurnitureLow(int index) => furnitureLow[index];
+        public float FurnitureHigh(int index) => furnitureHigh[index];
+        public bool FurnitureCleared(int index) => furnitureCleared != null && furnitureCleared[index];
+        public void SetFurnitureCleared(int index, bool cleared)
+        { if (CanRefreshFurniture(index)) furnitureCleared[index] = cleared; }
         public byte BaseCell(int index) => baseCells[index];
         public ScanNavigationGrid RoutingSnapshot()
         {
             var copy = new ScanNavigationGrid(Width, Height, OriginX, OriginZ, FloorY);
             Array.Copy(Cells, copy.Cells, Cells.Length);
             copy.baseCells = (byte[])baseCells.Clone();
+            copy.originalCells = (byte[])originalCells.Clone();
             return copy;
         }
         private ScanNavigationGrid(int width, int height, float x, float z, float floorY)
         { Width = width; Height = height; OriginX = x; OriginZ = z; FloorY = floorY; Cells = new byte[width * height]; }
 
         public static ScanNavigationGrid Build(IReadOnlyList<MeshPoint> vertices, IReadOnlyList<int> indices,
-            float floorY, float clearance, CancellationToken cancellation = default, bool strictCoverage = false, int authoritativeFloorIndices = -1)
+            float floorY, float clearance, CancellationToken cancellation = default, bool strictCoverage = false, int authoritativeFloorIndices = -1,
+            bool[] furnitureTriangles = null)
         {
             if (vertices == null || indices == null || indices.Count < 3 || indices.Count % 3 != 0
                 || !Finite(floorY) || !Finite(clearance) || clearance < 0f || clearance > 0.6f)
                 throw new ArgumentException("Invalid scan or clearance.");
+            if (furnitureTriangles != null && furnitureTriangles.Length != indices.Count / 3) throw new ArgumentException("Invalid furniture classification.");
             if (authoritativeFloorIndices < -1 || authoritativeFloorIndices > indices.Count
                 || (authoritativeFloorIndices >= 0 && authoritativeFloorIndices % 3 != 0)) throw new ArgumentException("Invalid semantic floor range.");
             var minX = float.PositiveInfinity; var maxX = float.NegativeInfinity;
@@ -57,6 +70,11 @@ namespace SpatialSense.RoomScan
             var height = (int)Math.Ceiling((maxZ - minZ) / CellSize) + 1;
             if (width > 256 || height > 256) throw new InvalidOperationException("This scan is too wide for the room route test. Use a smaller room area.");
             var map = new ScanNavigationGrid(width, height, minX, minZ, floorY);
+            map.floorCells = new byte[map.CellCount]; map.furniture = new bool[map.CellCount];
+            map.permanent = new bool[map.CellCount]; map.furnitureCleared = new bool[map.CellCount];
+            map.furnitureLow = new float[map.CellCount]; map.furnitureHigh = new float[map.CellCount];
+            for (var cell = 0; cell < map.CellCount; cell++)
+            { map.furnitureLow[cell] = float.PositiveInfinity; map.furnitureHigh[cell] = float.NegativeInfinity; }
             var evidence = new byte[map.CellCount];
             var obstacles = new bool[map.CellCount];
             for (var i = 0; i < indices.Count; i += 3)
@@ -87,7 +105,17 @@ namespace SpatialSense.RoomScan
                             if (Inside(px, pz, a, b, c)) evidence[index] |= (byte)(1 << sample);
                         }
                     }
-                    else if (Overlaps(a, b, c, left, bottom, CellSize)) obstacles[index] = true;
+                    else if (Overlaps(a, b, c, left, bottom, CellSize))
+                    {
+                        obstacles[index] = true;
+                        if (furnitureTriangles != null && furnitureTriangles[i / 3])
+                        {
+                            map.furniture[index] = true;
+                            map.furnitureLow[index] = Math.Min(map.furnitureLow[index], Math.Max(floorY + 0.2f, low));
+                            map.furnitureHigh[index] = Math.Max(map.furnitureHigh[index], Math.Min(floorY + 1.9f, high));
+                        }
+                        else map.permanent[index] = true;
+                    }
                 }
             }
             var radius = (int)Math.Ceiling(clearance / CellSize) + 1;
@@ -114,12 +142,38 @@ namespace SpatialSense.RoomScan
                     if (nx >= 0 && nz >= 0 && nx < width && nz < height && obstacles[nz * width + nx]) blocked = true;
                 }
                 map.Cells[index] = (byte)(obstacles[index] ? 1 : blocked ? 4 : incomplete ? 3 : 2);
+                map.floorCells[index] = (byte)(incomplete ? 3 : 2);
                 if (blocked) { map.ObstacleCount++; if (!obstacles[index]) map.MarginCount++; }
                 else if (incomplete) map.CoverageEdgeCount++;
                 else map.WalkableCount++;
             }
             map.baseCells = (byte[])map.Cells.Clone();
+            map.originalCells = (byte[])map.Cells.Clone();
             return map;
+        }
+
+        public void RebuildFurnitureBaseline(float clearance)
+        {
+            if (furniture == null) return;
+            var radius = (int)Math.Ceiling(clearance / CellSize) + 1;
+            for (var index = 0; index < CellCount; index++)
+            {
+                var raw = permanent[index] || (furniture[index] && !furnitureCleared[index]);
+                if (raw) { baseCells[index] = 1; continue; }
+                if (floorCells[index] == 0) { baseCells[index] = 0; continue; }
+                var blocked = false; var x = index % Width; var z = index / Width;
+                for (var dz = -radius; dz <= radius && !blocked; dz++) for (var dx = -radius; dx <= radius; dx++)
+                {
+                    var gx = Math.Max(0f, Math.Abs(dx) * CellSize - CellSize * 0.5f);
+                    var gz = Math.Max(0f, Math.Abs(dz) * CellSize - CellSize * 0.5f);
+                    if (gx * gx + gz * gz > clearance * clearance) continue;
+                    var nx = x + dx; var nz = z + dz;
+                    if (nx < 0 || nz < 0 || nx >= Width || nz >= Height) continue;
+                    var other = nz * Width + nx;
+                    if (permanent[other] || (furniture[other] && !furnitureCleared[other])) { blocked = true; break; }
+                }
+                baseCells[index] = blocked ? (byte)4 : floorCells[index];
+            }
         }
 
         public void ApplyLiveObstacles(IReadOnlyList<MeshPoint> points, float clearance)

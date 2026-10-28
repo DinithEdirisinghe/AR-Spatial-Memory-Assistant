@@ -6,7 +6,11 @@ namespace SpatialSense.RoomScan
     public readonly struct DepthObservationRay
     {
         public readonly MeshPoint Origin, Hit;
-        public DepthObservationRay(MeshPoint origin, MeshPoint hit) { Origin = origin; Hit = hit; }
+        public readonly MeshPoint Normal;
+        public readonly bool HasNormal;
+        public DepthObservationRay(MeshPoint origin, MeshPoint hit) { Origin = origin; Hit = hit; Normal = default; HasNormal = false; }
+        public DepthObservationRay(MeshPoint origin, MeshPoint hit, MeshPoint normal)
+        { Origin = origin; Hit = hit; Normal = normal; HasNormal = true; }
     }
 
     // Confirm new blocks over two batches. Missing observations do not remove

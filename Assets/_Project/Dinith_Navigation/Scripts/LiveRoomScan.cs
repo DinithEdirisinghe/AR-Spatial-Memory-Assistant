@@ -22,12 +22,10 @@ namespace SpatialSense.RoomScan
         [SerializeField] private OVRCameraRig rig;
         [SerializeField] private Material meshMaterial;
         [SerializeField] private Font font;
-        private const int MaxWidth = 14, MaxHeight = 10, MaxPatches = 600;
+        private const int MaxPatches = 600;
         private const float MaxRange = 3.5f, MaxEdge = 0.45f;
         private readonly List<Vector3> vertices = new List<Vector3>();
         private readonly List<int> triangles = new List<int>();
-        private readonly Vector3[] samples = new Vector3[MaxWidth * MaxHeight];
-        private readonly bool[] hits = new bool[MaxWidth * MaxHeight];
         private SpatialMeshAccumulator accumulator;
         private int duplicateFaces;
         private EnvironmentRaycastManager raycaster;
@@ -38,6 +36,9 @@ namespace SpatialSense.RoomScan
         private LiveScanNavigation navigation;
         private MetaRoomSource roomSource;
         private NativeItemWorkflow items;
+        public NavigationEvaluation Evaluation { get; private set; }
+        public MultiRoomNavigation RoomNavigation { get; private set; }
+        public HomeScanner Home { get; private set; }
         public NativeItemWorkflow Items => items;
         public MetaRoomSource Room => roomSource;
         public bool UseAppScan { get; private set; }
@@ -48,7 +49,9 @@ namespace SpatialSense.RoomScan
         private string processing;
         private bool dirty, statistics;
         public bool HasUnsavedExperimentalMesh => dirty;
-        private int detail = 1, overruns;
+        private int detail = 1;
+        private int sampleCell,viewCells,viewWidth,viewHeight,lastSampleCells;
+        private bool hasViewPose,viewHasGeometry;
         public bool MeshVisible { get; set; } = true;
         public bool IsScanning => scanning;
         public bool HasScan => anchor != null && triangles.Count > 0;
@@ -60,9 +63,9 @@ namespace SpatialSense.RoomScan
         public IReadOnlyList<int> CapturedTriangles => triangles;
         public LiveScanNavigation Navigation => navigation;
         public string DetailName => detail == 0 ? "Fast" : detail == 1 ? "Balanced" : "Detailed";
-        public string Summary => UseAppScan ? message : roomSource != null ? roomSource.Status : message;
+        public string Summary => UseAppScan ? "App live scan (MRUK): " + message : roomSource != null ? roomSource.Status : message;
         public bool StatisticsVisible => statistics;
-        public string Statistics => UseAppScan ? $"App scan: {vertices.Count} vertices | {triangles.Count / 3} triangles | {patches} patches | {DetailName}\n{(scanning ? "Capturing" : "Paused")} | {(dirty ? "Unsaved changes" : "Saved / unchanged")}" : roomSource != null ? roomSource.Diagnostics : "Room capture is not initialized.";
+        public string Statistics => UseAppScan ? $"MRUK app scan: {vertices.Count} vertices | {triangles.Count / 3} triangles | {DetailName}\n{(scanning ? "Capturing" : "Paused")} | {(dirty ? "Unsaved changes" : "Saved / unchanged")} | last batch {lastSampleCells} cells / {lastBatchMs:0.0} ms" : roomSource != null ? roomSource.Diagnostics : "Room capture is not initialized.";
         private string capturedAt;
         private string path;
         private bool scanning, busy, invalidated, savedAnchor;
@@ -85,6 +88,10 @@ namespace SpatialSense.RoomScan
             roomSource = gameObject.AddComponent<MetaRoomSource>(); roomSource.Configure(rig, meshMaterial);
             navigation = gameObject.AddComponent<LiveScanNavigation>(); navigation.Configure(this, rig, meshMaterial, roomSource);
             items = gameObject.AddComponent<NativeItemWorkflow>(); items.Configure(this, rig, meshMaterial, font);
+            RoomNavigation = gameObject.AddComponent<MultiRoomNavigation>(); RoomNavigation.Configure(this, rig);
+            Evaluation = gameObject.AddComponent<NavigationEvaluation>(); Evaluation.Configure(this, rig);
+            Home = gameObject.AddComponent<HomeScanner>(); Home.Configure(this, rig, meshMaterial);
+            roomSource.SetHomeMode(true);
             menu = gameObject.AddComponent<RoomScanMenu>(); menu.Configure(this, rig, meshMaterial, font);
             display = OVRManager.display;
             if (display != null) display.RecenteredPose += Invalidate;
@@ -97,7 +104,18 @@ namespace SpatialSense.RoomScan
         {
             if (rig == null || menu == null) return;
             if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.LTouch)) menu.Show(true);
-            if (!IsWorking)
+            if (Home != null && Home.Active)
+            {
+                if (!Home.Busy && !MenuOpen)
+                {
+                    if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch)) { if(Home.Scanning)Home.Pause();else Home.StartOrContinue(); }
+                    if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch)) Home.Pause();
+                    if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.LTouch)) menu.CycleView();
+                }
+                if(meshObject!=null)meshObject.GetComponent<MeshRenderer>().enabled=false;
+                return;
+            }
+            if (!IsWorking && (Evaluation == null || !Evaluation.IsLocked))
             {
                 if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch)) { if (UseAppScan) ToggleCapture(); else roomSource.ScanRoom(); }
                 else if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch)) { if (UseAppScan) SaveScan(); else roomSource.SaveRoomCopy(); }
@@ -128,14 +146,14 @@ namespace SpatialSense.RoomScan
         public void ShowFloorMap() { menu.ShowMap(); }
         public void ToggleStatistics() { statistics = !statistics; }
         public void MarkMetadataChanged() { dirty = true; }
-        public void CycleDetail() { detail = (detail + 1) % 3; overruns = 0; capturedPose = false; message = "Scan detail: " + DetailName + "."; }
+        public void CycleDetail() { detail = (detail + 1) % 3; capturedPose = false; hasViewPose = false; message = "Scan detail: " + DetailName + "."; }
         public void PauseCapture()
         {
             scanning = false;
             DisableProbeDepth();
         }
         public bool EnableDepthForProbe() => EnsureDepth();
-        public void DisableProbeDepth() { if (!scanning && (navigation == null || !navigation.LiveEnabled) && raycaster != null) raycaster.enabled = false; }
+        public void DisableProbeDepth() { if ((Home == null || !Home.Active) && !scanning && (navigation == null || !navigation.LiveEnabled) && raycaster != null) raycaster.enabled = false; }
         public bool TryProbe(Ray ray, out Vector3 point, out Vector3 normal)
         {
             point = normal = default;
@@ -180,8 +198,8 @@ namespace SpatialSense.RoomScan
                 if (operation != generation || !Tracked) throw new InvalidOperationException("Scan tracking changed.");
                 if (accumulator.AtCapacity) { DisableProbeDepth(); message = "This scan is full. Save/export it, then start a new scan."; return; }
                 navigation.GeometryChanged();
-                capturedPose = false; scanning = true;
-                processing = "SpatialWeld2cmNormal30deg";
+                capturedPose = false; hasViewPose = false; scanning = true;
+                processing = "SpatialWeld2cmNormal30degBudgetedCells";
                 message = "Capture resumed. Look around the floor and nearby objects.";
                 menu.Show(false);
             }
@@ -236,9 +254,9 @@ namespace SpatialSense.RoomScan
                 anchor = candidate;
                 candidate = null;
                 savedAnchor = false;
-                vertices.Clear(); triangles.Clear(); patches = 0; capturedPose = false;
+                vertices.Clear(); triangles.Clear(); patches = 0; capturedPose = false; hasViewPose = false; sampleCell = 0;
                 accumulator = new SpatialMeshAccumulator(); duplicateFaces = 0;
-                processing = "SpatialWeld2cmNormal30deg"; dirty = false;
+                processing = "SpatialWeld2cmNormal30degBudgetedCells"; dirty = false;
                 navigation.GeometryChanged(true);
                 lastBatchMs = lastCleanupMs = 0f;
                 invalidated = false;
@@ -264,37 +282,31 @@ namespace SpatialSense.RoomScan
             var head = rig.centerEyeAnchor;
             var width = detail == 0 ? 8 : detail == 1 ? 10 : 14;
             var height = detail == 0 ? 6 : detail == 1 ? 8 : 10;
-            // Capture after a viewpoint change, rather than appending the same patch every frame.
-            if (capturedPose && Vector3.Distance(head.position, lastCapturePosition) < 0.12f
-                && Quaternion.Angle(head.rotation, lastCaptureRotation) < 12f) return;
+            var changed=!hasViewPose || width!=viewWidth || height!=viewHeight || Vector3.Distance(head.position,lastCapturePosition)>=0.12f
+                || Quaternion.Angle(head.rotation,lastCaptureRotation)>=12f;
+            if(capturedPose && !changed)return;
+            if(changed)
+            {
+                viewCells=0;viewHasGeometry=false;capturedPose=false;hasViewPose=true;viewWidth=width;viewHeight=height;
+                lastCapturePosition=head.position;lastCaptureRotation=head.rotation;
+            }
+            var position=head.position;var rotation=head.rotation;
             var clock = System.Diagnostics.Stopwatch.StartNew();
-            for (var y = 0; y < height; y++) for (var x = 0; x < width; x++)
+            var totalCells=(width-1)*(height-1);
+            var batch=DepthPatchSampler.Capture(width,height,sampleCell,totalCells-viewCells,MaxEdge,8,(x,y)=>
             {
-                var index = y * MaxWidth + x;
-                var direction = head.rotation * new Vector3(Mathf.Lerp(-0.466f, 0.466f, x / (float)(width - 1)),
+                var direction = rotation * new Vector3(Mathf.Lerp(-0.466f, 0.466f, x / (float)(width - 1)),
                     Mathf.Lerp(-0.364f, 0.364f, y / (float)(height - 1)), 1f).normalized;
-                hits[index] = raycaster.Raycast(new Ray(head.position, direction), out var hit, MaxRange)
-                    && Finite(hit.point) && Vector3.Distance(head.position, hit.point) >= 0.3f;
-                if (hits[index]) samples[index] = anchor.transform.InverseTransformPoint(hit.point);
-                // Drop an unfinished patch rather than joining samples taken across different frames.
-                if (clock.Elapsed.TotalMilliseconds > 8)
-                {
-                    lastBatchMs = (float)clock.Elapsed.TotalMilliseconds; overruns++;
-                    if (overruns >= 3 && detail > 0) { detail--; overruns = 0; }
-                    message = "Sampling was slow; incomplete view discarded. Current detail: " + DetailName + ".";
-                    return;
-                }
-            }
-            overruns = 0;
-            lastBatchMs = (float)clock.Elapsed.TotalMilliseconds;
-            var localTriangles = new List<int>();
-            for (var y = 0; y < height - 1; y++) for (var x = 0; x < width - 1; x++)
-            {
-                var a = y * MaxWidth + x;
-                AddTriangle(localTriangles, a, a + MaxWidth, a + 1);
-                AddTriangle(localTriangles, a + 1, a + MaxWidth, a + MaxWidth + 1);
-            }
-            if (localTriangles.Count == 0)
+                var valid=raycaster.Raycast(new Ray(position,direction),out var hit,MaxRange) && Finite(hit.point)
+                    && Vector3.Distance(position,hit.point)>=0.3f;
+                return new DepthPatchSample(valid,valid?ToPoint(anchor.transform.InverseTransformPoint(hit.point)):default);
+            },()=>clock.Elapsed.TotalMilliseconds);
+            sampleCell=batch.NextCell;viewCells+=batch.VisitedCells;lastSampleCells=batch.VisitedCells;
+            viewHasGeometry|=batch.Triangles.Count>0;
+            capturedPose=viewCells>=totalCells && viewHasGeometry;
+            if(viewCells>=totalCells && !viewHasGeometry)hasViewPose=false;
+            lastBatchMs=(float)batch.Milliseconds;
+            if (batch.Triangles.Count == 0)
             {
                 if (Time.unscaledTime - lastHitTime > 10f)
                     message = "No usable live surface patch yet. Look at a textured nearby surface; check permissions, OpenXR and headset logs if this continues.";
@@ -303,13 +315,10 @@ namespace SpatialSense.RoomScan
             lastHitTime = Time.unscaledTime;
             clock.Restart();
             var previousIndexCount = accumulator.Indices.Count;
-            for (var i = 0; i < localTriangles.Count; i += 3)
-                accumulator.AddTriangle(ToPoint(samples[localTriangles[i]]), ToPoint(samples[localTriangles[i + 1]]),
-                    ToPoint(samples[localTriangles[i + 2]]));
+            foreach(var triangle in batch.Triangles)accumulator.AddTriangle(triangle.A,triangle.B,triangle.C);
             duplicateFaces = accumulator.DuplicateFaces;
             patches++;
             dirty = true; lastCapturedAt = DateTime.UtcNow.ToString("O");
-            capturedPose = true; lastCapturePosition = head.position; lastCaptureRotation = head.rotation;
             if (accumulator.Indices.Count != previousIndexCount)
             {
                 CopyAccumulator();
@@ -317,21 +326,14 @@ namespace SpatialSense.RoomScan
                 navigation.GeometryChanged();
             }
             lastCleanupMs = (float)clock.Elapsed.TotalMilliseconds;
-            message = "Capturing nearby surfaces and floor. A pauses; B saves.";
+            message = batch.BudgetReached ? $"Capturing smaller completed patches ({viewCells}/{totalCells} view cells). Hold briefly, then look around. A pauses; B saves."
+                : "Capturing nearby surfaces and floor. A pauses; B saves.";
             if (patches >= MaxPatches || accumulator.AtCapacity)
             {
                 scanning = false;
                 DisableProbeDepth();
                 message = "Scan limit reached. Press B to save, or A for a new scan.";
             }
-        }
-
-        private void AddTriangle(List<int> target, int a, int b, int c)
-        {
-            var ab = samples[b] - samples[a]; var ac = samples[c] - samples[a];
-            if (!DepthTrianglePolicy.Accept(hits[a], hits[b], hits[c], ab.sqrMagnitude,
-                ac.sqrMagnitude, (samples[c] - samples[b]).sqrMagnitude, Vector3.Cross(ab, ac).sqrMagnitude, MaxEdge)) return;
-            target.Add(a); target.Add(b); target.Add(c);
         }
 
         private static MeshPoint ToPoint(Vector3 value) => new MeshPoint(value.x, value.y, value.z);

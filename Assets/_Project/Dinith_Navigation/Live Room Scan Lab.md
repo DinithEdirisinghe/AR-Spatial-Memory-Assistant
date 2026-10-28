@@ -1,6 +1,14 @@
-# Room scan lab — current v7, native capture history
+# Room scan lab — current v10, native capture history
 
-**Current build: SpatialSense | Dynamic routing v7.** The Scan tab has a Method switch for Meta room scan and App live scan. Each uses its own mesh and walking map. The App tools tab contains live scan detail, floor selection, coverage and OBJ export controls. App mesh saves include the chosen floor height. See [Dynamic Routing.md](Dynamic%20Routing.md) for the latest live-obstacle test and [Native Item Finding.md](Native%20Item%20Finding.md) for scan comparison and item finding. The native-only v4.1 instructions below are historical; no scene recreation is required.
+**v10.1 MRUK capture fix:** App live scan previously discarded all samples when the full grid exceeded 8 ms, potentially making no progress even on Fast. It now completes 2x2 surface cells within each capture call, retains valid triangles and rotates through remaining cells across calls. A view can finish while you hold still; no triangle joins measurements from different calls. A completely missing-data view retries so depth warmup cannot permanently freeze capture. The budget is cooperative: an indivisible four-ray cell can exceed it if an SDK call is slow. Detail stays at your selected setting. Statistics show cells per batch and sampling time. Geometry updates now explain that the walking map needs rebuilding rather than repeatedly reporting Route cleared.
+
+Use **Scan > Method: App live scan > Start / continue MRUK scan** for in-app depth capture. Use **Method: Meta room scan > Open Meta room setup** for the headset's full-screen capture. They are separate paths even though both use Meta SDK facilities. After a slow in-app batch, hold briefly to let the view fill, then pan slowly. Capture still requires valid depth and nearby geometry; missing depth and discontinuities are not converted into floor. Tools/Test-DepthPatchSampler.ps1 covers the budget-starvation regression and triangle validity rules. A Quest capture retest is required.
+
+**Current panel title: SpatialSense | Connected rooms v10.** See [Connected Rooms.md](Connected%20Rooms.md) for the Rooms tab, persistent doorway links and item finding between rooms. App scanning and the single-room evaluation workflow remain available with the scope described in that guide.
+
+**Current panel title: SpatialSense | Evaluation lab v9.** See [Evaluation Lab.md](Evaluation%20Lab.md) for the new Tests tab, comparison modes, trial outcomes and CSV exports. The scanning and furniture behavior below is retained outside evaluation trials.
+
+**Current build: SpatialSense | Furniture updates v8.** The Scan tab retains Meta room scan and App live scan, each with its own mesh and walking map. App tools contains live scan detail, floor selection, coverage and OBJ export controls. See [Moved Furniture Updates.md](Moved%20Furniture%20Updates.md) for classified baseline-furniture corrections, [Dynamic Routing.md](Dynamic%20Routing.md) for live obstacles and [Native Item Finding.md](Native%20Item%20Finding.md) for item finding. The native-only v4.1 instructions below are historical; no scene recreation is required.
 
 ## The corrected goal
 

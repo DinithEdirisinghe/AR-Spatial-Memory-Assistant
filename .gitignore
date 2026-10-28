@@ -35,3 +35,6 @@ Thumbs.db
 /Assets/_Recovery.meta
 /Assets/XR/Temp/
 /Assets/XR/Temp.meta
+
+# Downloaded on-headset trial data and CSV exports
+/EvaluationResults/

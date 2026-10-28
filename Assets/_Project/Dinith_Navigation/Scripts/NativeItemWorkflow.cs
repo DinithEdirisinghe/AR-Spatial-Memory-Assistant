@@ -31,6 +31,13 @@ namespace SpatialSense.RoomScan
         public event Action<ApplicationStateSnapshot> StateChanged;
         public ApplicationStateSnapshot CurrentState { get; private set; }
         public string SelectedId => ObservationPolicy.IdFor(Selected.ObjectName);
+        public int SelectedSlot => selected;
+        public bool FoundConfirmed => found;
+        public string SelectedSavedRoomId
+        {
+            get { return Initialized && Selected.TryGetStoredObservation(out var observation) ? observation.RoomId : null; }
+        }
+        private bool SavedInOtherRoom => !string.IsNullOrEmpty(SelectedSavedRoomId) && SelectedSavedRoomId!=app.Room.RoomUuid.ToString("D");
         private PersistentObjectMemory Selected => memories[selected];
         public bool IsBusy
         {
@@ -48,7 +55,7 @@ namespace SpatialSense.RoomScan
             get
             {
                 if (memories == null) return "Starting item memory...";
-                var text = Selected.ObjectName + ": " + Selected.ListStatus;
+                var text = Selected.ObjectName + ": " + (SavedInOtherRoom && app.RoomNavigation!=null ? "Saved in "+app.RoomNavigation.Label(SelectedSavedRoomId) : Selected.ListStatus);
                 if (Selected.TryGetStoredObservation(out var sighting))
                     text += "\nLast saved: " + sighting.ObservedAtUtc.ToLocalTime().ToString("g") + " | "
                         + (sighting.Origin == ObservationOrigin.ManualController ? "manual registration" : sighting.Origin.ToString());
@@ -94,7 +101,10 @@ namespace SpatialSense.RoomScan
         public string SlotLabel(int slot)
         {
             var name = slot == 0 ? "Keys" : slot == 1 ? "Wallet" : "Remote";
-            return name + (slot == selected ? " [selected]" : "") + "\n" + memories[slot].ListStatus;
+            var state=memories[slot].ListStatus;
+            if(memories[slot].TryGetStoredObservation(out var saved) && saved.RoomId!=app.Room.RoomUuid.ToString("D") && app.RoomNavigation!=null)
+                state="Saved in "+app.RoomNavigation.Label(saved.RoomId);
+            return name + (slot == selected ? " [selected]" : "") + "\n" + state;
         }
         public void Select(int slot)
         {
@@ -117,7 +127,12 @@ namespace SpatialSense.RoomScan
         {
             if (!CanFind) return;
             UpdateContext();
-            Cancel(); pendingFind = true; found = false;
+            Cancel();
+            if(SavedInOtherRoom && app.RoomNavigation!=null)
+            {
+                app.RoomNavigation.BeginFind(SelectedId,SelectedSavedRoomId); Status=app.RoomNavigation.Status;app.CloseMenu();return;
+            }
+            pendingFind = true; found = false;
             if (!Selected.HasLocatedPosition)
             {
                 Selected.RetryLoad(); operation = "locate"; operationStarted = Time.unscaledTime;
@@ -151,6 +166,7 @@ namespace SpatialSense.RoomScan
         }
         public void Cancel()
         {
+            app?.RoomNavigation?.Cancel();
             workflowGeneration++;
             if (HasActiveFlow) diagnostics?.Record("item_action_cancelled", SelectedId, IsBusy ? "Guidance cancelled; native anchor operation continues." : "User action or context change.");
             if (planning || pendingFind || (app != null && app.Navigation.RouteOwner == SelectedId)) app.Navigation.ClearRoute();
@@ -161,6 +177,7 @@ namespace SpatialSense.RoomScan
 
         private void Update()
         {
+            if(app!=null && app.Home!=null && app.Home.Active){marker.SetActive(false);labelRoot.SetActive(false);return;}
             if (!Initialized) return;
             UpdateContext();
             if (forgetToken != null && !ForgetArmed) { forgetToken = null; Status = "Forget confirmation expired. Nothing else was removed."; }
@@ -206,6 +223,7 @@ namespace SpatialSense.RoomScan
             if (searching) Status = !app.Navigation.RouteAvailable ? app.Navigation.Status
                 : CanConfirm ? "Near " + Selected.ObjectName + "'s last saved position. Check the item, then choose Found it."
                 : "Follow the blue path to the ring. The marker shows the last saved location, not a new detection.";
+            if(app.RoomNavigation!=null && app.RoomNavigation.IsFinding)Status=app.RoomNavigation.Status;
             if (Time.unscaledTime >= nextPoll) { nextPoll = Time.unscaledTime + 0.2f; PublishState(); }
         }
 
@@ -313,6 +331,8 @@ namespace SpatialSense.RoomScan
         }
         private void OnCommitted(PersistentObjectMemory memory)
         {
+            if(memory==Selected && app.RoomNavigation!=null && app.RoomNavigation.IsFinding)
+                app.RoomNavigation.Cancel("The saved item changed. Choose Find again for its new room.");
             if (memory == Selected && operation == "save") saveCommitted = true;
             if (memory == Selected && (searching || planning || pendingFind))
             { Cancel(); Status = "This item's saved location changed. Choose Find to use the new location."; }
@@ -335,7 +355,7 @@ namespace SpatialSense.RoomScan
                     : Selected.Availability == ObjectLocationState.Removing ? ApplicationPhase.RemovingObject : ApplicationPhase.LocatingObject
                 : operation == "save" ? ApplicationPhase.SavingObject
                 : operation == "forget" ? ApplicationPhase.RemovingObject : operation == "locate" || planning || pendingFind ? ApplicationPhase.LocatingObject
-                : armed ? ApplicationPhase.AwaitingObservation : found ? ApplicationPhase.Found : searching ? ApplicationPhase.Searching
+                : armed ? ApplicationPhase.AwaitingObservation : found ? ApplicationPhase.Found : searching || (app.RoomNavigation!=null && app.RoomNavigation.IsFinding) ? ApplicationPhase.Searching
                 : Selected.HasLocatedPosition ? ApplicationPhase.Ready : Selected.HasSavedRecord ? ApplicationPhase.Unavailable : ApplicationPhase.SelectingObject;
             var next = new ApplicationStateSnapshot { Phase = phase, SelectedObjectId = SelectedId, Message = Status };
             if (CurrentState.Phase != next.Phase || CurrentState.SelectedObjectId != next.SelectedObjectId || CurrentState.Message != next.Message)
